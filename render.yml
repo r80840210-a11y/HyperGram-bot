@@ -1,11 +1,19 @@
 services:
-  - type: worker
-    name: hypergram-registration-demo
+  - type: web
+    name: xypergram-registration
     runtime: python
+    plan: free
     buildCommand: pip install -r requirements.txt
     startCommand: python bot.py
+    healthCheckPath: /health
     envVars:
       - key: BOT_TOKEN
         sync: false
       - key: DB_PATH
-        value: hypergram.db
+        value: xypergram.db
+      - key: WEBHOOK_SECRET
+        sync: false
+      - key: PHONE_POOL_RU
+        sync: false
+      - key: PHONE_POOL_US
+        sync: false

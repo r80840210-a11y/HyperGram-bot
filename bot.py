@@ -1,291 +1,134 @@
-import os
-import asyncio
-import logging
-import random
-import sqlite3
+import os, json, sqlite3, asyncio, logging, secrets, hmac
 from datetime import datetime, timezone
-
 from aiohttp import web
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import CommandStart
-from aiogram.types import Message, CallbackQuery
+from aiogram.types import CallbackQuery, Message
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
-# Render Web Service settings
-BOT_TOKEN = os.environ["BOT_TOKEN"]
-PORT = int(os.getenv("PORT", "10000"))
-DB_PATH = os.getenv("DB_PATH", "hypergram.db")
+TOKEN=os.environ["BOT_TOKEN"]
+PORT=int(os.getenv("PORT","10000"))
+DB=os.getenv("DB_PATH","xypergram.db")
+SECRET=os.getenv("WEBHOOK_SECRET","")
+logging.basicConfig(level=logging.INFO)
+bot=Bot(TOKEN); dp=Dispatcher()
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(name)s: %(message)s"
-)
-log = logging.getLogger("hypergram")
+def pool(key):
+    try: return json.loads(os.getenv(key,"[]"))
+    except Exception as e: raise RuntimeError(f"{key} must be a JSON array") from e
+POOLS={"ru":pool("PHONE_POOL_RU"),"us":pool("PHONE_POOL_US")}
 
-bot = Bot(token=BOT_TOKEN)
-dp = Dispatcher()
+def now(): return datetime.now(timezone.utc).isoformat()
+def conn():
+    c=sqlite3.connect(DB,timeout=20)
+    c.execute("PRAGMA busy_timeout=20000")
+    c.execute("CREATE TABLE IF NOT EXISTS users(uid INTEGER PRIMARY KEY, username TEXT, created TEXT)")
+    c.execute("""CREATE TABLE IF NOT EXISTS numbers(
+      id INTEGER PRIMARY KEY AUTOINCREMENT, uid INTEGER, country TEXT, phone TEXT UNIQUE,
+      status TEXT DEFAULT 'active', created TEXT, released TEXT)""")
+    c.execute("CREATE TABLE IF NOT EXISTS inbox(id INTEGER PRIMARY KEY AUTOINCREMENT, phone TEXT, body TEXT, created TEXT)")
+    return c
 
-# Fictional sandbox numbers for interface testing only.
-# They do not receive real SMS or third-party verification messages.
-TEST_NUMBERS = {
-    "ru": [
-        "+7 000 000 0101",
-        "+7 000 000 0102",
-        "+7 000 000 0103",
-        "+7 000 000 0104",
-        "+7 000 000 0105",
-    ],
-    "us": [
-        "+1 202 555 0101",
-        "+1 202 555 0102",
-        "+1 202 555 0103",
-        "+1 202 555 0104",
-        "+1 202 555 0105",
-    ],
-}
-
-
-def connect_db():
-    conn = sqlite3.connect(DB_PATH, timeout=20)
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS users (
-            user_id INTEGER PRIMARY KEY,
-            username TEXT,
-            first_seen TEXT NOT NULL
-        )
-    """)
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS numbers (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER NOT NULL,
-            country TEXT NOT NULL,
-            phone TEXT NOT NULL UNIQUE,
-            test_code TEXT NOT NULL,
-            created_at TEXT NOT NULL
-        )
-    """)
-    return conn
-
-
-def main_keyboard():
-    kb = InlineKeyboardBuilder()
-    kb.button(text="📱 Получить тестовый номер", callback_data="get")
-    kb.button(text="📂 Мои номера", callback_data="mine")
-    kb.adjust(1)
-    return kb.as_markup()
-
-
-def country_keyboard():
-    kb = InlineKeyboardBuilder()
-    kb.button(text="🇷🇺 Россия (+7)", callback_data="country:ru")
-    kb.button(text="🇺🇸 США (+1)", callback_data="country:us")
-    kb.button(text="⬅️ Назад", callback_data="home")
-    kb.adjust(1)
-    return kb.as_markup()
-
+def menu():
+    k=InlineKeyboardBuilder()
+    k.button(text="📱 Получить номер",callback_data="get")
+    k.button(text="📂 Мои номера",callback_data="mine")
+    k.adjust(1); return k.as_markup()
+def countries():
+    k=InlineKeyboardBuilder()
+    k.button(text="🇷🇺 Россия (+7)",callback_data="c:ru")
+    k.button(text="🇺🇸 США (+1)",callback_data="c:us")
+    k.button(text="⬅️ Назад",callback_data="home")
+    k.adjust(1); return k.as_markup()
+def active(uid):
+    c=conn(); r=c.execute("SELECT country,phone,created FROM numbers WHERE uid=? AND status='active' ORDER BY id DESC LIMIT 1",(uid,)).fetchone(); c.close(); return r
 
 @dp.message(CommandStart())
-async def start(message: Message):
-    conn = connect_db()
-    conn.execute(
-        "INSERT OR IGNORE INTO users(user_id, username, first_seen) VALUES (?, ?, ?)",
-        (
-            message.from_user.id,
-            message.from_user.username or "",
-            datetime.now(timezone.utc).isoformat(),
-        ),
-    )
-    conn.commit()
-    conn.close()
+async def start(m:Message):
+    c=conn(); c.execute("INSERT OR IGNORE INTO users VALUES(?,?,?)",(m.from_user.id,m.from_user.username or "",now())); c.commit(); c.close()
+    await m.answer("🚀 Добро пожаловать в XyperGram!\n\nЗдесь вы можете получить номер для регистрации в XyperGram и получать сообщения подтверждения.\n\nУ каждого пользователя может быть только один активный номер.",reply_markup=menu())
 
-    await message.answer(
-        "🚀 Добро пожаловать в HyperGram!\n\n"
-        "В этой демонстрационной версии можно получить тестовый номер "
-        "и посмотреть тестовый код.\n\n"
-        "Важно: номера и коды вымышленные. Они не принимают реальные SMS "
-        "и не предназначены для подтверждения аккаунтов в Telegram "
-        "или других сторонних сервисах.",
-        reply_markup=main_keyboard(),
-    )
+@dp.callback_query(F.data=="home")
+async def home(q:CallbackQuery):
+    await q.message.edit_text("🚀 Главное меню XyperGram",reply_markup=menu()); await q.answer()
 
+@dp.callback_query(F.data=="get")
+async def get(q:CallbackQuery):
+    if active(q.from_user.id):
+        await q.answer("У вас уже есть активный номер. Завершите текущую регистрацию.",show_alert=True); return
+    await q.message.edit_text("Выберите страну:",reply_markup=countries()); await q.answer()
 
-@dp.callback_query(F.data == "home")
-async def home(call: CallbackQuery):
-    await call.message.edit_text(
-        "🚀 Главное меню HyperGram",
-        reply_markup=main_keyboard(),
-    )
-    await call.answer()
-
-
-@dp.callback_query(F.data == "get")
-async def choose_country(call: CallbackQuery):
-    await call.message.edit_text(
-        "Выберите страну тестового номера:",
-        reply_markup=country_keyboard(),
-    )
-    await call.answer()
-
-
-@dp.callback_query(F.data.startswith("country:"))
-async def issue_number(call: CallbackQuery):
-    country = call.data.split(":", 1)[1]
-    if country not in TEST_NUMBERS:
-        await call.answer("Неизвестная страна", show_alert=True)
-        return
-
-    conn = connect_db()
-    used = {
-        row[0]
-        for row in conn.execute("SELECT phone FROM numbers").fetchall()
-    }
-    available = [phone for phone in TEST_NUMBERS[country] if phone not in used]
-
+@dp.callback_query(F.data.startswith("c:"))
+async def choose(q:CallbackQuery):
+    country=q.data.split(":")[1]
+    if country not in POOLS:
+        await q.answer("Страна не поддерживается",show_alert=True); return
+    c=conn(); c.execute("BEGIN IMMEDIATE")
+    if c.execute("SELECT 1 FROM numbers WHERE uid=? AND status='active'",(q.from_user.id,)).fetchone():
+        c.rollback(); c.close(); await q.answer("У вас уже есть активный номер",show_alert=True); return
+    used={x[0] for x in c.execute("SELECT phone FROM numbers WHERE status='active'")}
+    available=[p for p in POOLS[country] if p not in used]
     if not available:
-        conn.close()
-        await call.answer(
-            "Тестовые номера закончились.",
-            show_alert=True,
-        )
-        return
+        c.rollback(); c.close(); await q.answer("Нет свободных номеров. Проверьте пул провайдера.",show_alert=True); return
+    phone=secrets.choice(available)
+    c.execute("INSERT INTO numbers(uid,country,phone,status,created) VALUES(?,?,?,'active',?)",(q.from_user.id,country,phone,now()))
+    c.commit(); c.close()
+    k=InlineKeyboardBuilder(); k.button(text="📩 Сообщения",callback_data="inbox"); k.button(text="✅ Завершить регистрацию",callback_data="release"); k.button(text="🏠 Главное меню",callback_data="home"); k.adjust(1)
+    await q.message.edit_text(f"✅ Ваш номер:\n`{phone}`\n\nОн закреплён за вами. Сообщения для XyperGram появятся в разделе «Сообщения».",parse_mode="Markdown",reply_markup=k.as_markup()); await q.answer()
 
-    phone = random.choice(available)
-    test_code = f"{random.randint(0, 999999):06d}"
+@dp.callback_query(F.data=="mine")
+async def mine(q:CallbackQuery):
+    r=active(q.from_user.id)
+    text=f"📂 Ваш активный номер:\n`{r[1]}`" if r else "У вас пока нет активного номера."
+    k=InlineKeyboardBuilder()
+    if r: k.button(text="📩 Сообщения",callback_data="inbox"); k.button(text="✅ Завершить регистрацию",callback_data="release")
+    else: k.button(text="📱 Получить номер",callback_data="get")
+    k.button(text="🏠 Главное меню",callback_data="home"); k.adjust(1)
+    await q.message.edit_text(text,parse_mode="Markdown",reply_markup=k.as_markup()); await q.answer()
 
-    conn.execute(
-        """
-        INSERT INTO numbers(user_id, country, phone, test_code, created_at)
-        VALUES (?, ?, ?, ?, ?)
-        """,
-        (
-            call.from_user.id,
-            country,
-            phone,
-            test_code,
-            datetime.now(timezone.utc).isoformat(),
-        ),
-    )
-    conn.commit()
-    conn.close()
+@dp.callback_query(F.data=="inbox")
+async def inbox(q:CallbackQuery):
+    r=active(q.from_user.id)
+    if not r: await q.answer("Сначала получите номер",show_alert=True); return
+    c=conn(); rows=c.execute("SELECT body,created FROM inbox WHERE phone=? ORDER BY id DESC LIMIT 10",(r[1],)).fetchall(); c.close()
+    text="📩 Пока нет новых сообщений." if not rows else "📩 Сообщения XyperGram:\n\n"+"\n\n".join(x[0] for x in rows)
+    k=InlineKeyboardBuilder(); k.button(text="🔄 Обновить",callback_data="inbox"); k.button(text="⬅️ Мои номера",callback_data="mine"); k.adjust(1)
+    await q.message.edit_text(text,reply_markup=k.as_markup()); await q.answer()
 
-    kb = InlineKeyboardBuilder()
-    kb.button(
-        text="📩 Показать тестовый код",
-        callback_data=f"code:{phone}",
-    )
-    kb.button(text="📂 Мои номера", callback_data="mine")
-    kb.button(text="🏠 Главное меню", callback_data="home")
-    kb.adjust(1)
+@dp.callback_query(F.data=="release")
+async def release(q:CallbackQuery):
+    c=conn(); c.execute("UPDATE numbers SET status='released',released=? WHERE uid=? AND status='active'",(now(),q.from_user.id)); c.commit(); c.close()
+    await q.message.edit_text("✅ Регистрация завершена. Номер освобождён.",reply_markup=menu()); await q.answer()
 
-    country_name = "Россия" if country == "ru" else "США"
-    await call.message.edit_text(
-        f"✅ Тестовый номер выдан!\n\n"
-        f"Страна: {country_name}\n"
-        f"Номер: `{phone}`\n\n"
-        "Это демонстрационный номер: реальные SMS на него не поступают.",
-        parse_mode="Markdown",
-        reply_markup=kb.as_markup(),
-    )
-    await call.answer()
+async def health(req): return web.json_response({"status":"ok","service":"XyperGram"})
+async def webhook(req):
+    raw=await req.read()
+    if SECRET and not hmac.compare_digest(req.headers.get("X-Webhook-Secret",""),SECRET):
+        return web.json_response({"error":"unauthorized"},status=401)
+    try: data=json.loads(raw)
+    except Exception: return web.json_response({"error":"invalid_json"},status=400)
+    # Accept only verification messages explicitly tagged for your own XyperGram service.
+    if data.get("service")!="xypergram": return web.json_response({"error":"unsupported_service"},status=400)
+    phone=str(data.get("phone","")).strip(); body=str(data.get("message","")).strip()
+    if not phone or not body: return web.json_response({"error":"phone_and_message_required"},status=400)
+    c=conn(); row=c.execute("SELECT uid FROM numbers WHERE phone=? AND status='active'",(phone,)).fetchone()
+    if not row: c.close(); return web.json_response({"status":"ignored"})
+    c.execute("INSERT INTO inbox(phone,body,created) VALUES(?,?,?)",(phone,body[:1500],now())); c.commit(); c.close()
+    try: await bot.send_message(row[0],"📩 Новое сообщение для XyperGram:\n\n"+body[:1500])
+    except Exception: logging.exception("User notification failed")
+    return web.json_response({"status":"accepted"})
 
-
-@dp.callback_query(F.data.startswith("code:"))
-async def show_test_code(call: CallbackQuery):
-    phone = call.data.split(":", 1)[1]
-    conn = connect_db()
-    row = conn.execute(
-        "SELECT test_code FROM numbers WHERE user_id = ? AND phone = ?",
-        (call.from_user.id, phone),
-    ).fetchone()
-    conn.close()
-
-    if row is None:
-        await call.answer("Номер не найден в вашем профиле.", show_alert=True)
-        return
-
-    await call.message.answer(
-        f"📩 Демонстрационный код для {phone}: `{row[0]}`\n\n"
-        "Это локальный тестовый код, а не входящее SMS.",
-        parse_mode="Markdown",
-    )
-    await call.answer()
-
-
-@dp.callback_query(F.data == "mine")
-async def my_numbers(call: CallbackQuery):
-    conn = connect_db()
-    rows = conn.execute(
-        """
-        SELECT country, phone, created_at
-        FROM numbers
-        WHERE user_id = ?
-        ORDER BY id DESC
-        """,
-        (call.from_user.id,),
-    ).fetchall()
-    conn.close()
-
-    if not rows:
-        text = "📂 У вас пока нет тестовых номеров."
-    else:
-        entries = []
-        for country, phone, created_at in rows:
-            flag = "🇷🇺 Россия" if country == "ru" else "🇺🇸 США"
-            entries.append(
-                f"{flag}\n`{phone}`\nПолучен: {created_at[:10]}"
-            )
-        text = "📂 Ваши тестовые номера:\n\n" + "\n\n".join(entries)
-
-    kb = InlineKeyboardBuilder()
-    kb.button(text="➕ Получить номер", callback_data="get")
-    kb.button(text="🏠 Главное меню", callback_data="home")
-    kb.adjust(1)
-
-    await call.message.edit_text(
-        text,
-        parse_mode="Markdown",
-        reply_markup=kb.as_markup(),
-    )
-    await call.answer()
-
-
-async def health(request):
-    return web.json_response({
-        "status": "ok",
-        "service": "HyperGram Registration Bot",
-    })
-
-
-async def start_http_server():
-    app = web.Application()
-    app.router.add_get("/", health)
-    app.router.add_get("/health", health)
-
-    runner = web.AppRunner(app)
-    await runner.setup()
-
-    site = web.TCPSite(
-        runner,
-        host="0.0.0.0",
-        port=PORT,
-    )
-    await site.start()
-    log.info("HTTP health server listening on 0.0.0.0:%s", PORT)
+async def serve():
+    app=web.Application(client_max_size=65536)
+    app.router.add_get("/",health); app.router.add_get("/health",health); app.router.add_post("/provider-webhook",webhook)
+    runner=web.AppRunner(app); await runner.setup()
+    await web.TCPSite(runner,"0.0.0.0",PORT).start()
+    logging.info("Listening on 0.0.0.0:%s",PORT)
     return runner
 
-
 async def main():
-    # Render detects this HTTP listener as the Web Service port.
-    runner = await start_http_server()
+    runner=await serve()
+    try: await dp.start_polling(bot)
+    finally: await runner.cleanup(); await bot.session.close()
 
-    try:
-        # Long polling requires exactly one active process per bot token.
-        log.info("Starting HyperGram bot polling")
-        await dp.start_polling(bot)
-    finally:
-        await runner.cleanup()
-        await bot.session.close()
-
-
-if __name__ == "__main__":
-    asyncio.run(main())
+if __name__=="__main__": asyncio.run(main())
